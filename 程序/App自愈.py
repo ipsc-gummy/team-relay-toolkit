@@ -305,7 +305,12 @@ def health_once(c):
         raise Failure('HTTP_REDIRECT' if 300<=ex.code<400 else 'HTTP_FAILURE',ex.code) from None
     except urllib.error.URLError as ex:
         reason=ex.reason
-        raise Failure('TUNNEL_MISSING' if isinstance(reason,OSError) and reason.errno==errno.ECONNREFUSED else 'NETWORK_TRANSIENT') from None
+        refused=(isinstance(reason,ConnectionRefusedError) or
+                 isinstance(reason,OSError) and
+                 (reason.errno==errno.ECONNREFUSED or getattr(reason,'winerror',None)==10061))
+        # Winsock 10061 is WSAECONNREFUSED; timeouts must remain retryable.
+        if isinstance(reason,(TimeoutError,socket.timeout)):refused=False
+        raise Failure('TUNNEL_MISSING' if refused else 'NETWORK_TRANSIENT') from None
     except (TimeoutError,socket.timeout):raise Failure('NETWORK_TRANSIENT') from None
     except (ValueError,UnicodeError):raise Failure('HEALTH_RESPONSE_INVALID') from None
 

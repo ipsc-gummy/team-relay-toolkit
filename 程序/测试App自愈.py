@@ -1,5 +1,6 @@
 """隔离 HOME/配置/网络替身；不操作正式 App、SSH 或凭据。"""
 import copy
+import errno
 import importlib.util
 import json
 import os
@@ -290,10 +291,37 @@ class HealingTests(unittest.TestCase):
                     with self.assertRaises(real.Failure) as ex:real.health_once(c)
                     self.assertEqual(ex.exception.reason,reason)
                     self.assertNotIn('secret',str(ex.exception))
-            opener=mock.Mock();opener.open.side_effect=urllib.error.URLError(ConnectionRefusedError(61,'refused'))
-            with mock.patch.object(real.urllib.request,'build_opener',return_value=opener):
-                with self.assertRaises(real.Failure) as ex:real.health_once(c)
-                self.assertEqual(ex.exception.reason,'TUNNEL_MISSING')
+            native_refused=OSError();native_refused.errno=errno.ECONNREFUSED
+            windows_refused=OSError();windows_refused.winerror=10061
+            windows_timeout=OSError();windows_timeout.winerror=10060
+            network_errors=[
+                ('native-refused',ConnectionRefusedError(errno.ECONNREFUSED,'refused'),'TUNNEL_MISSING'),
+                ('mac-refused',ConnectionRefusedError(61,'refused'),'TUNNEL_MISSING'),
+                ('linux-refused',ConnectionRefusedError(111,'refused'),'TUNNEL_MISSING'),
+                ('windows-refused',ConnectionRefusedError(10061,'refused'),'TUNNEL_MISSING'),
+                ('native-errno',native_refused,'TUNNEL_MISSING'),
+                ('windows-winerror',windows_refused,'TUNNEL_MISSING'),
+                ('timeout',TimeoutError('timed out'),'NETWORK_TRANSIENT'),
+                ('linux-timeout',TimeoutError(110,'timed out'),'NETWORK_TRANSIENT'),
+                ('mac-timeout',TimeoutError(60,'timed out'),'NETWORK_TRANSIENT'),
+                ('windows-timeout',TimeoutError(10060,'timed out'),'NETWORK_TRANSIENT'),
+                ('windows-raw-timeout',windows_timeout,'NETWORK_TRANSIENT'),
+                ('connection-reset',ConnectionResetError(errno.ECONNRESET,'reset'),'NETWORK_TRANSIENT'),
+                ('network-unreachable',OSError(errno.ENETUNREACH,'unreachable'),'NETWORK_TRANSIENT'),
+                ('plain-message','Connection refused','NETWORK_TRANSIENT'),
+            ]
+            for label,error,expected in network_errors:
+                with self.subTest(network_error=label):
+                    opener=mock.Mock();opener.open.side_effect=urllib.error.URLError(error)
+                    with mock.patch.object(real.urllib.request,'build_opener',return_value=opener):
+                        with self.assertRaises(real.Failure) as ex:real.health_once(c)
+                        self.assertEqual(ex.exception.reason,expected)
+            for error in (TimeoutError('timed out'),real.socket.timeout('timed out')):
+                with self.subTest(direct_timeout=type(error).__name__):
+                    opener=mock.Mock();opener.open.side_effect=error
+                    with mock.patch.object(real.urllib.request,'build_opener',return_value=opener):
+                        with self.assertRaises(real.Failure) as ex:real.health_once(c)
+                        self.assertEqual(ex.exception.reason,'NETWORK_TRANSIENT')
 
     @unittest.skip('Private deployment/rollback script is excluded from the public source release')
     def test_deployment_rollback_exact_and_conflict_safe(self):
