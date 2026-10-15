@@ -1,0 +1,42 @@
+#!/usr/bin/python3 -I
+"""Restricted login shell: only one's own usage report, never execute shell input."""
+import os
+import socket
+import sys
+
+SOCKET = '/run/sysu-usage-query/query.sock'
+FORCED = 'sysu-usage-query'
+COMMAND = 'share-codex-usage'
+
+
+def allowed(args, original):
+    return args == ['--query'] or (args == ['-c', FORCED] and original == COMMAND)
+
+
+def main():
+    if not allowed(sys.argv[1:], os.environ.get('SSH_ORIGINAL_COMMAND')):
+        print('只允许执行 share-codex-usage 查询本人用量；不提供 shell、SFTP 或其他命令。', file=sys.stderr)
+        return 126
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(10)
+            connection.connect(SOCKET)
+            # No user-controlled request body or username; server uses SO_PEERCRED.
+            chunks=[]; size=0
+            while True:
+                data=connection.recv(65536)
+                if not data:
+                    break
+                size += len(data)
+                if size > 256*1024:
+                    raise ValueError('report size limit')
+                chunks.append(data)
+            sys.stdout.buffer.write(b''.join(chunks)); sys.stdout.buffer.flush()
+        return 0
+    except (OSError, ValueError):
+        print('统计查询服务暂不可用，请联系管理员；原 SSH 隧道无需重建。', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
