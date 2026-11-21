@@ -2,6 +2,7 @@
 """Smoke-test a pinned official Linux binary against a loopback-only fake upstream."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,7 +85,8 @@ def require(condition, step):
     print("CPA_PILOT_PASS=" + step, flush=True)
 
 
-def smoke(archive):
+@contextmanager
+def running_fixture(archive):
     # A missing network namespace must not quietly turn this into a live test.
     if {name for _, name in socket.if_nameindex()} != {"lo"}:
         raise SystemExit("Run in a private Linux network namespace with only lo enabled")
@@ -106,13 +108,15 @@ def smoke(archive):
             worker = Thread(target=server.serve_forever, daemon=True)
             worker.start()
             try:
-                run_binary(root, binary, server.server_port, client_key, upstream_key, routes)
+                with running_binary(root, binary, server.server_port, client_key, upstream_key) as port:
+                    yield port, client_key, routes
             finally:
                 server.shutdown()
                 worker.join(timeout=3)
 
 
-def run_binary(root, binary, upstream_port, client_key, upstream_key, routes):
+@contextmanager
+def running_binary(root, binary, upstream_port, client_key, upstream_key):
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
         _, port = reserved.getsockname()
@@ -147,15 +151,7 @@ def run_binary(root, binary, upstream_port, client_key, upstream_key, routes):
                     continue
                 require(status == 200 and MODEL.encode() in data, "model-catalog")
                 break
-            status, _, _ = fetch(port, "/v1/models")
-            require(status == 401 and not routes, "unauthenticated-rejected")
-            body = {"model": MODEL, "input": "synthetic", "stream": False}
-            status, _, data = fetch(port, "/v1/responses", client_key, body)
-            require(status == 200 and MARKER.encode() in data, "responses-json")
-            status, headers, data = fetch(port, "/v1/responses", client_key, dict(body, stream=True))
-            require(status == 200 and "text/event-stream" in headers.get("Content-Type", "")
-                    and b"response.completed" in data and MARKER.encode() in data, "responses-sse")
-            require(routes == ["/v1/chat/completions"] * 2, "synthetic-upstream-only")
+            yield port
         finally:
             service.terminate()
             try:
@@ -163,6 +159,19 @@ def run_binary(root, binary, upstream_port, client_key, upstream_key, routes):
             except subprocess.TimeoutExpired:
                 service.kill()
                 service.wait(timeout=5)
+
+
+def smoke(archive):
+    with running_fixture(archive) as (port, client_key, routes):
+        status, _, _ = fetch(port, "/v1/models")
+        require(status == 401 and not routes, "unauthenticated-rejected")
+        body = {"model": MODEL, "input": "synthetic", "stream": False}
+        status, _, data = fetch(port, "/v1/responses", client_key, body)
+        require(status == 200 and MARKER.encode() in data, "responses-json")
+        status, headers, data = fetch(port, "/v1/responses", client_key, dict(body, stream=True))
+        require(status == 200 and "text/event-stream" in headers.get("Content-Type", "")
+                and b"response.completed" in data and MARKER.encode() in data, "responses-sse")
+        require(routes == ["/v1/chat/completions"] * 2, "synthetic-upstream-only")
 
 
 if __name__ == "__main__":

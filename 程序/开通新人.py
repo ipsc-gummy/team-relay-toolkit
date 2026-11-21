@@ -30,6 +30,43 @@ def effective(user):
     return run('/usr/sbin/sshd', '-T', '-C', f'user={user},host=localhost,addr=198.51.100.10').stdout
 
 
+def restricted_tunnel_policy(user, public_key, public_fingerprint, gateway_port):
+    """Render a forward-only member for a per-member loopback budget gateway.
+
+    Does not register a user, change sshd or enroll the member key in CPA.
+    The caller supplies an independently verified recipient fingerprint.
+    """
+    if not re.fullmatch(r'[a-z][a-z0-9_-]{0,30}', user) or user == 'root':
+        raise ValueError('invalid member')
+    if type(gateway_port) is not int or not 1024 <= gateway_port <= 65535:
+        raise ValueError('invalid gateway port')
+    if not re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', public_fingerprint):
+        raise ValueError('invalid member fingerprint')
+    # Keep just the public-key type and blob; never copy options or comments.
+    match = re.fullmatch(r'ssh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [^\r\n]*)?', public_key)
+    if not match:
+        raise ValueError('expected an Ed25519 public key')
+    target = f'127.0.0.1:{gateway_port}'
+    with tempfile.TemporaryDirectory(prefix='member-public-') as work:
+        pub = Path(work) / 'member.pub'
+        key = 'ssh-ed25519 ' + match[1]
+        exclusive(pub, key + '\n')
+        words = run('ssh-keygen', '-lf', str(pub)).stdout.split()
+        if len(words) < 2 or words[1] != public_fingerprint:
+            raise ValueError('member fingerprint does not match')
+    settings = {
+        'AuthenticationMethods': 'publickey',
+        'PasswordAuthentication': 'no', 'KbdInteractiveAuthentication': 'no',
+        'AllowTcpForwarding': 'local', 'AllowStreamLocalForwarding': 'no',
+        'PermitOpen': target, 'PermitListen': 'none', 'MaxSessions': '0',
+        'PermitTTY': 'no', 'AllowAgentForwarding': 'no', 'X11Forwarding': 'no',
+        'PermitUserRC': 'no', 'PermitTunnel': 'no', 'GatewayPorts': 'no',
+    }
+    config = 'Match User ' + user + '\n' + ''.join(f'    {k} {v}\n' for k, v in settings.items()) + 'Match all\n'
+    authorized = f'restrict,port-forwarding,permitopen="{target}" {key}\n'
+    return config, authorized
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--user', required=True)
