@@ -138,7 +138,8 @@ LogLevel ERROR
     return config, constants, known, wire_token
 
 
-def probe(root, config, constants, known, token, cpa_port, cpa_token, ledger, routes):
+@contextmanager
+def member_tunnel(root, config, constants, known, token, bypass_port, bypass_token):
     base = ["ssh", "-F", "/dev/null", "-T", "-p", str(constants["SSH_PORT"]), "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", f"UserKnownHostsFile={known}", "-o", "ConnectTimeout=3", "-o", "ExitOnForwardFailure=yes"]
@@ -152,36 +153,45 @@ def probe(root, config, constants, known, token, cpa_port, cpa_token, ledger, ro
         require(run(*base, *auth, "-N", "-R", f"{HOST}:0:{HOST}:{local}", target).returncode == 255,
                 "remote-forward-disabled")
         with process([*base, *auth, "-N", "-L", f"{HOST}:{local}:{constants['TARGET']}",
-                      "-L", f"{HOST}:{bypass}:{HOST}:{cpa_port}", target]) as tunnel:
+                      "-L", f"{HOST}:{bypass}:{HOST}:{bypass_port}", target]) as tunnel:
             wait_until(lambda: tunnel.poll() is None and fetch(local, "/v1/models", token)[0] == 200,
                        "package-ssh-tunnel")
             require(True, "package-ssh-tunnel")
             try:
-                fetch(bypass, "/v1/models", cpa_token)
+                fetch(bypass, "/v1/models", bypass_token)
             except (OSError, ConnectionError):
-                require(True, "direct-cpa-forward-blocked-even-with-its-token")
+                require(True, "alternate-forward-blocked-even-with-its-token")
             else:
-                require(False, "direct-cpa-forward-blocked-even-with-its-token")
-            body = {"model": MODEL, "input": "synthetic", "stream": False}
-            require(fetch(local, "/v1/responses", "wrong-fixture-token", body)[0] == 401 and not routes,
-                    "wrong-member-bearer-rejected-before-upstream")
-            status, _, payload = fetch(local, "/v1/responses", token, body)
-            require(status == 200 and MARKER.encode() in payload, "member-json")
-            wait_until(lambda: ledger.balance(MEMBER).available == 7, "first-charge-settled")
-            status, headers, payload = fetch(local, "/v1/responses", token, dict(body, stream=True))
-            require(status == 200 and "text/event-stream" in headers.get("Content-Type", "")
-                    and b"response.completed" in payload and MARKER.encode() in payload, "member-sse")
-            wait_until(lambda: ledger.balance(MEMBER).available == 4, "second-charge-settled")
-            status, _, payload = fetch(local, "/v1/responses", token, body)
-            require(status == 429 and b"fixture_budget_exhausted" in payload and len(routes) == 2,
-                    "member-over-limit-rejected-before-upstream")
+                require(False, "alternate-forward-blocked-even-with-its-token")
+            yield local
 
 
-def smoke(archive):
+def probe(root, config, constants, known, token, cpa_port, cpa_token, ledger, routes):
+    with member_tunnel(root, config, constants, known, token, cpa_port, cpa_token) as local:
+        body = {"model": MODEL, "input": "synthetic", "stream": False}
+        require(fetch(local, "/v1/responses", "wrong-fixture-token", body)[0] == 401 and not routes,
+                "wrong-member-bearer-rejected-before-upstream")
+        status, _, payload = fetch(local, "/v1/responses", token, body)
+        require(status == 200 and MARKER.encode() in payload, "member-json")
+        wait_until(lambda: ledger.balance(MEMBER).available == 7, "first-charge-settled")
+        status, headers, payload = fetch(local, "/v1/responses", token, dict(body, stream=True))
+        require(status == 200 and "text/event-stream" in headers.get("Content-Type", "")
+                and b"response.completed" in payload and MARKER.encode() in payload, "member-sse")
+        wait_until(lambda: ledger.balance(MEMBER).available == 4, "second-charge-settled")
+        status, _, payload = fetch(local, "/v1/responses", token, body)
+        require(status == 429 and b"fixture_budget_exhausted" in payload and len(routes) == 2,
+                "member-over-limit-rejected-before-upstream")
+
+
+def require_isolated_namespace():
     if (os.geteuid() != 0 or {name for _, name in socket.if_nameindex()} != {"lo"}
             or os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net")):
         raise SystemExit("Root and a separate Linux network namespace with only lo are required")
     pwd.getpwnam(MEMBER)
+
+
+def smoke(archive):
+    require_isolated_namespace()
     # StrictModes rejects the world-writable ancestor of an authorization file.
     with tempfile.TemporaryDirectory(prefix="relay-member-pilot-", dir="/run") as temp, running_fixture(archive) as fixture:
         root = Path(temp)

@@ -236,7 +236,11 @@ class DollarCapTests(unittest.TestCase):
             self.assertEqual(self.fetch(token=token)[0], 401)
         for path in ("/v1/responses/compact", "/v1/chat/completions", "/v1/responses?route=alternate"):
             self.assertEqual(self.fetch(path=path)[0], 404)
-        for field, value in (("instructions", "unreviewed field"), ("tools", [{"type": "web_search"}]),
+        for field, value in (("instructions", ["unsupported instructions"]),
+                             ("tools", [{"type": "web_search", "name": "disguised_web"}]),
+                             ("tools", [{"type": "mcp", "name": "remote"}]),
+                             ("tools", [{"type": "function", "name": "worker", "async": True}]),
+                             ("include", ["web_search_call.action.sources"]), ("store", True),
                              ("previous_response_id", "resp_other"), ("background", True),
                              ("service_tier", "priority"), ("model", "gpt-other"), ("stream", 1),
                              ("max_output_tokens", 4097), ("max_output_tokens", True),
@@ -259,6 +263,24 @@ class DollarCapTests(unittest.TestCase):
         expected = dict(BODY, service_tier="default", store=False, truncation="disabled")
         self.assertEqual({key: request.get(key) for key in expected}, expected)
         self.assertFalse(any(key in request for key in ("tools", "previous_response_id", "background")))
+        self.assert_spend(FINAL, wait=True)
+
+    def test_client_run_tool_and_text_replay_remain_bounded(self):
+        args = dict(BODY, instructions="Only use local tools.", tool_choice="auto", parallel_tool_calls=False,
+                    store=False, include=["reasoning.encrypted_content"], reasoning={"effort": "low"},
+                    tools=[{"type": "function", "name": "local_echo", "parameters": {"type": "object"}}],
+                    client_metadata={"x-codex-window-id": "not_forwarded"}, input=[
+                        {"role": "user", "content": "count"},
+                        {"type": "function_call", "call_id": "call_fixture", "name": "local_echo", "arguments": "{}"},
+                        {"type": "function_call_output", "call_id": "call_fixture", "output": "fixture_result"},
+                        {"type": "message", "role": "assistant", "content":[
+                            {"type": "output_text", "text": "done", "annotations": []}], "status": "completed"},
+                    ])
+        self.assertEqual(self.fetch(body=args)[0], 200)
+        actual = self.calls[0][2]
+        self.assertNotIn("client_metadata", actual)
+        for field in ("input", "tools", "instructions"):
+            self.assertEqual(actual[field], args[field])
         self.assert_spend(FINAL, wait=True)
 
     def test_complete_sse_forwards_delta_and_settles(self):

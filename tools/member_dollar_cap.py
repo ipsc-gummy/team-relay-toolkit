@@ -30,6 +30,7 @@ MAX_INPUT, DEFAULT_OUTPUT, MAX_OUTPUT = 400_000, 256, 4096
 MAX_REQUEST, MAX_RESPONSE, MAX_EVENT = 128 * 1024, 2 * 1024 * 1024, 256 * 1024
 REVIEW_UNTIL = datetime(2026, 11, 29, tzinfo=timezone.utc)
 MEMBER_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
+TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class Rejected(ValueError):
@@ -61,7 +62,10 @@ class Policy:
 
     def prepare(self, raw):
         data = parse(raw)
-        if not isinstance(data, dict) or data.keys() - {"model", "input", "stream", "max_output_tokens"}:
+        if not isinstance(data, dict) or data.keys() - {
+            "model", "input", "stream", "max_output_tokens", "instructions", "tools", "tool_choice",
+            "parallel_tool_calls", "reasoning", "store", "include", "prompt_cache_key", "text", "client_metadata",
+        }:
             raise Rejected("unsupported_request_fields")
         if data.get("model") != MODEL:
             raise Rejected("unsupported_model")
@@ -71,9 +75,61 @@ class Policy:
             raise Rejected("only_text_input_supported")
         if type(output) is not int or not 16 <= output <= MAX_OUTPUT:
             raise Rejected("invalid_output_limit")
+        self._local_codex_fields(data)
         data.update(service_tier="default", store=False, truncation="disabled", stream=stream,
                     max_output_tokens=output)
         return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), stream, output
+
+    @staticmethod
+    def _local_codex_fields(data):
+        if (data.get("store", False) is not False or data.get("tool_choice", "auto") not in ("auto", "none")
+                or type(data.get("parallel_tool_calls", False)) is not bool
+                or not isinstance(data.get("instructions", ""), str)
+                or data.get("include", []) not in ([], ["reasoning.encrypted_content"])
+                or not isinstance(data.get("prompt_cache_key", ""), str)):
+            raise Rejected("unpriced_or_invalid_request_option")
+        # Non-inference client telemetry is unnecessary to the independent project.
+        metadata = data.pop("client_metadata", None)
+        if metadata is not None and (not isinstance(metadata, dict) or
+                                     not all(isinstance(value, str) for value in metadata.values())):
+            raise Rejected("invalid_client_metadata")
+        reasoning = data.get("reasoning")
+        if reasoning is None:
+            data.pop("reasoning", None)
+        elif (not isinstance(reasoning, dict) or reasoning.keys() - {"effort", "summary"}
+              or reasoning.get("effort") not in (None, "none", "low", "medium", "high", "xhigh")
+              or reasoning.get("summary") not in (None, "auto", "concise", "detailed")):
+            raise Rejected("invalid_reasoning_option")
+        text = data.get("text")
+        if text is None:
+            data.pop("text", None)
+        elif (not isinstance(text, dict) or text.keys() - {"verbosity", "format"}
+              or text.get("verbosity") not in (None, "low", "medium", "high")
+              or text.get("format", {"type": "text"}) != {"type": "text"}):
+            raise Rejected("unsupported_text_format")
+        tools = data.get("tools", [])
+        if not isinstance(tools, list) or len(tools) > 64:
+            raise Rejected("unsupported_tools")
+        for tool in tools:
+            if not isinstance(tool, dict) or not Policy._name(tool.get("name")):
+                raise Rejected("unsupported_tools")
+            if not isinstance(tool.get("description", ""), str):
+                raise Rejected("unsupported_tools")
+            kind = tool.get("type")
+            if kind == "function" and not tool.keys() - {"type", "name", "description", "parameters", "strict"}:
+                if isinstance(tool.get("parameters", {}), dict) and type(tool.get("strict", False)) is bool:
+                    continue
+            if kind == "custom" and not tool.keys() - {"type", "name", "description", "format"}:
+                fmt = tool.get("format", {"type": "text"})
+                if fmt == {"type": "text"} or (isinstance(fmt, dict)
+                        and fmt.keys() == {"type", "syntax", "definition"} and fmt["type"] == "grammar"
+                        and fmt["syntax"] in ("lark", "regex") and isinstance(fmt["definition"], str)):
+                    continue
+            raise Rejected("hosted_or_unreviewed_tool")
+
+    @staticmethod
+    def _name(value):
+        return isinstance(value, str) and TOOL_NAME.fullmatch(value) is not None
 
     @staticmethod
     def _text_input(value):
@@ -82,19 +138,65 @@ class Policy:
         if not isinstance(value, list) or not 1 <= len(value) <= 256:
             return False
         for message in value:
-            if (not isinstance(message, dict) or message.keys() - {"type", "role", "content"}
-                    or message.get("type", "message") != "message"
+            if not isinstance(message, dict):
+                return False
+            kind = message.get("type", "message")
+            if kind in ("function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "reasoning"):
+                if not Policy._local_history_item(message, kind):
+                    return False
+                continue
+            if (message.keys() - {"type", "role", "content", "id", "status", "phase"} or kind != "message"
                     or message.get("role") not in ("system", "developer", "user", "assistant")):
+                return False
+            if not Policy._item_metadata(message) or message.get("phase") not in (None, "commentary", "final_answer"):
                 return False
             content = message.get("content")
             if isinstance(content, str) and content:
                 continue
             if (not isinstance(content, list) or not 1 <= len(content) <= 256
-                    or any(not isinstance(part, dict) or part.keys() != {"type", "text"}
-                           or part["type"] != "input_text" or not isinstance(part["text"], str)
-                           or not part["text"] for part in content)):
+                    or any(not Policy._text_part(part, message["role"] == "assistant") for part in content)):
                 return False
         return True
+
+    @staticmethod
+    def _item_metadata(item):
+        return (item.get("status") in (None, "completed", "in_progress", "incomplete")
+                and isinstance(item.get("id", ""), str))
+
+    @staticmethod
+    def _text_part(part, output):
+        if not isinstance(part, dict) or not isinstance(part.get("text"), str) or not part["text"]:
+            return False
+        if part.get("type") == "input_text":
+            return part.keys() == {"type", "text"}
+        return (output and part.get("type") == "output_text" and not part.keys() - {"type", "text", "annotations"}
+                and part.get("annotations", []) == [])
+
+    @staticmethod
+    def _local_history_item(item, kind):
+        if not Policy._item_metadata(item):
+            return False
+        if kind == "reasoning":
+            if item.keys() - {"type", "id", "status", "summary", "content", "encrypted_content"}:
+                return False
+            for field, part_type in (("summary", "summary_text"), ("content", "reasoning_text")):
+                entries = item.get(field)
+                if entries is not None and (not isinstance(entries, list) or any(
+                        not isinstance(part, dict) or part.keys() != {"type", "text"}
+                        or part["type"] != part_type or not isinstance(part["text"], str) for part in entries)):
+                    return False
+            opaque = item.get("encrypted_content")
+            return opaque is None or isinstance(opaque, str)
+        common = {"type", "id", "status", "call_id"}
+        if not isinstance(item.get("call_id"), str) or not item["call_id"]:
+            return False
+        if kind in ("function_call", "custom_tool_call"):
+            text_key = "arguments" if kind == "function_call" else "input"
+            return (not item.keys() - common - {"name", text_key} and Policy._name(item.get("name"))
+                    and isinstance(item.get(text_key), str))
+        output = item.get("output")
+        return not item.keys() - common - {"output"} and (isinstance(output, str) or (
+            isinstance(output, list) and all(Policy._text_part(part, False) for part in output)))
 
     @staticmethod
     def completed_cost(response, output):
