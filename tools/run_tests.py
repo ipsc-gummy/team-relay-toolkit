@@ -16,6 +16,7 @@ TESTS = (
     "tools/test_stage_release.py",
     "tools/test_pilot_budget.py",
     "tools/test_pilot_member_gateway.py",
+    "tools/test_member_dollar_cap.py",
     "程序/测试打包部署参数.py",
 )
 

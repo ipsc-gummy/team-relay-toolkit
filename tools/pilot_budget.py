@@ -1,4 +1,4 @@
-"""Offline pilot ledger for synthetic integer credits, independent of any API.
+"""Transactional ledger for integer credits or nano-USD, independent of any API.
 
 Reserve a proven upper bound before dispatch. A duplicate request ID is never a
 second authorization to dispatch. A missing final charge retains the whole hold
@@ -109,6 +109,7 @@ class PilotBudget:
             uri = self.path.as_uri() + ("?mode=rw" if write else "?mode=ro")
             with closing(sqlite3.connect(uri, uri=True, timeout=3, isolation_level=None)) as db:
                 db.execute("PRAGMA foreign_keys = ON")
+                db.execute("PRAGMA synchronous = FULL")
                 db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield db
                 db.commit()
