@@ -13,6 +13,8 @@ TESTS = (
     "程序/App切换/测试切换.py",
     "程序/测试新人一键接入.py",
     "程序/用量统计/test_usage.py",
+    "tools/test_stage_release.py",
+    "tools/test_pilot_budget.py",
 )
 
 
