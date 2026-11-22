@@ -36,6 +36,9 @@ FINGERPRINTS = {
     "owner": "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8",
 }
 HOST_FP = "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8"
+BUDGET_MODE = False  # Set only in a verified --budget-mac package.
+BUDGET_MODEL = "gpt-5.4-mini-2026-03-17"
+BUDGET_PROVIDER = "sg_team_budget"
 
 
 class SafeError(Exception):
@@ -57,6 +60,33 @@ def read_regular(path):
     if path.is_symlink() or not path.is_file():
         raise SafeError("所需文件不存在、不是普通文件或是符号链接；请让本机 Agent 检查。")
     return path.read_bytes()
+
+
+def config_bytes(path, allow_missing=False):
+    path = Path(path)
+    if allow_missing and not path.exists() and not path.is_symlink():
+        return b""
+    return read_regular(path)
+
+
+def route_equivalent(left, right):
+    if left == right:
+        return True
+    if not BUDGET_MODE:
+        return False
+
+    def comparable(content):
+        parsed = tomllib.loads(content.decode())
+        marketplace = parsed.get("marketplaces", {}).get("openai-bundled", {})
+        if isinstance(marketplace, dict) and "last_updated" in marketplace:
+            stamp = marketplace["last_updated"]
+            if not isinstance(stamp, str):
+                raise SafeError("市场更新时间格式未知；未覆盖配置。")
+            datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            marketplace["last_updated"] = None
+        return parsed
+
+    return comparable(left) == comparable(right)
 
 
 def atomic_write(path, data, mode=0o600):
@@ -159,17 +189,35 @@ def make_team_config(original, state, settings):
     original_mode = settings.get("baseline_kind") == "original" and settings.get("user") == "owner"
     if not original_mode and parsed.get("model_provider", "openai") != "openai":
         raise SafeError("原配置不是内置个人模式。请先核实本人 Plus 基线，不能把其他中转当成个人模式。")
-    if "sg_team" in parsed.get("model_providers", {}):
+    provider_id = BUDGET_PROVIDER if BUDGET_MODE else "sg_team"
+    if provider_id in parsed.get("model_providers", {}):
         raise SafeError("已有同名提供商；请本机 Agent 先核实，不覆盖。")
+    model = settings["model"]
+    root_overrides = {}
+    if BUDGET_MODE:
+        if model != BUDGET_MODEL or parsed.get("profile"):
+            raise SafeError("团队模式需要固定模型；有覆盖用 profile 时先由本机 Agent 核对，不改当前配置。")
+        root_overrides = {"web_search": "disabled", "model_reasoning_effort": "medium"}
     # Restrict edits to simple root-level model selectors. Unusual TOML fails closed
     # via the full parsed-diff check rather than modifying unrelated content.
     lines = text.splitlines(keepends=True)
     in_root = True
+    in_features = skipped = saw_features = False
     kept = []
     for line in lines:
         if re.match(r"^\s*\[", line):
             in_root = False
-        if in_root and re.match(r"^\s*(model_provider|model)\s*=", line):
+            in_features = BUDGET_MODE and bool(re.match(r"^\s*\[features\]\s*(?:#.*)?$", line))
+            skipped = BUDGET_MODE and bool(re.match(r"^\s*\[mcp_servers(?:\.|\])", line))
+            if in_features:
+                saw_features = True
+                kept.extend((line.rstrip("\r\n") + "\n", "multi_agent = false\n"))
+                continue
+        root_setting = re.match(r"^\s*([a-z_]+)\s*=", line) if in_root else None
+        if root_setting and root_setting[1] in {"model_provider", "model", *root_overrides}:
+            continue
+        if BUDGET_MODE and (skipped or (root_setting and root_setting[1] == "mcp_servers")
+                            or (in_features and re.match(r"^\s*multi_agent\s*=", line))):
             continue
         kept.append(line)
     quote = lambda value: json.dumps(value, ensure_ascii=False)
@@ -184,15 +232,22 @@ def make_team_config(original, state, settings):
             "refresh_interval_ms": 0,
         },
     }
-    prefix = f'model_provider = "sg_team"\nmodel = {quote(settings["model"])}\n'
-    suffix = '\n\n[model_providers.sg_team]\n'
-    suffix += "".join(f"{key} = {quote(provider[key])}\n" for key in ("name", "base_url", "wire_api"))
-    suffix += '\n[model_providers.sg_team.auth]\n'
+    if BUDGET_MODE:
+        provider.update(request_max_retries=0, stream_max_retries=0, supports_websockets=False)
+    prefix = f'model_provider = "{provider_id}"\nmodel = {quote(model)}\n'
+    prefix += "".join(f"{key} = {quote(value)}\n" for key, value in root_overrides.items())
+    suffix = '\n\n[features]\nmulti_agent = false\n' if BUDGET_MODE and not saw_features else ''
+    suffix += f'\n\n[model_providers.{provider_id}]\n'
+    suffix += "".join(f"{key} = {quote(value)}\n" for key, value in provider.items() if key != "auth")
+    suffix += f'\n[model_providers.{provider_id}.auth]\n' if BUDGET_MODE else '\n[model_providers.sg_team.auth]\n'
     suffix += "".join(f"{key} = {quote(value)}\n" for key, value in provider["auth"].items())
     result = prefix + "".join(kept) + suffix
     expected = copy.deepcopy(parsed)
-    expected.update(model_provider="sg_team", model=settings["model"])
-    expected.setdefault("model_providers", {})["sg_team"] = provider
+    expected.update(model_provider=provider_id, model=model, **root_overrides)
+    expected.setdefault("model_providers", {})[provider_id] = provider
+    if BUDGET_MODE:
+        expected.setdefault("features", {})["multi_agent"] = False
+        expected.pop("mcp_servers", None)
     try:
         actual = tomllib.loads(result)
     except tomllib.TOMLDecodeError:
@@ -214,7 +269,8 @@ def initialize(args, state):
     if not args.user or not args.ssh_key or not args.key_file:
         raise SafeError("首次配置缺少本人用户名、SSH 私钥路径或中转密钥文件。")
     config = Path(args.config).expanduser().absolute()
-    original = read_regular(config)
+    config_existed = config.exists()
+    original = config_bytes(config, allow_missing=BUDGET_MODE)
     tomllib.loads(original.decode())
     private_key = Path(args.ssh_key).expanduser().absolute()
     if private_key.is_symlink() or not private_key.is_file():
@@ -239,6 +295,14 @@ def initialize(args, state):
     if not 1024 <= args.port <= 65535:
         raise SafeError("本机端口须为 1024 至 65535。")
     team = make_team_config(original, state, settings)
+    pin = None
+    if BUDGET_MODE:
+        if HOST_FP == "SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8" or not args.known_hosts:
+            raise SafeError("没有已核实的团队主机公钥。")
+        pin = read_regular(args.known_hosts)
+        verify_pin(pin, keygen)
+        settings["known_hosts"] = str(state / "known_hosts")
+        settings["config_existed"] = config_existed
     if state.exists():
         raise SafeError("已有本机状态目录；不会重复初始化或覆盖原备份。")
     state.mkdir(mode=0o700, parents=True)
@@ -251,6 +315,8 @@ def initialize(args, state):
     atomic_write(state / ("original.toml" if baseline == "original" else "personal.toml"), original)
     atomic_write(state / "team.toml", team)
     atomic_write(state / "中转访问密钥.txt", (key + "\n").encode())
+    if pin is not None:
+        atomic_write(state / "known_hosts", pin)
     atomic_write(state / "切换CodexApp.py", Path(__file__).read_bytes())
     settings.update(personal_hash=digest(original), team_hash=digest(team))
     atomic_write(state / "settings.json", json.dumps(settings, ensure_ascii=False, indent=2).encode())
@@ -271,6 +337,8 @@ def api_ready(state, settings):
             data = json.loads(response.read(1024 * 1024))
             if response.status != 200 or not isinstance(data,dict) or not isinstance(data.get('data'),list):
                 raise HealthError('HEALTH_RESPONSE_INVALID')
+            if BUDGET_MODE and [item.get('id') for item in data['data'] if isinstance(item, dict)] != [BUDGET_MODEL]:
+                raise HealthError('EXPECTED_BUDGET_MODEL_MISSING')
             return True
     except urllib.error.HTTPError as exc:
         if exc.code in (401,403):raise HealthError('AUTH_FAILURE',exc.code) from None
@@ -293,15 +361,34 @@ def health_check(state,settings):
             time.sleep(.5*(2**attempt))
 
 
+def verify_pin(pin, keygen):
+    fields = pin.strip().split()
+    if (len(pin.splitlines()) != 1 or len(fields) != 3 or
+            fields[:2] != [HOST.encode(), b"ssh-ed25519"]):
+        raise SafeError("团队主机公钥格式或目标不匹配。")
+    result = subprocess.run([keygen, "-lf", "-"], input=pin, capture_output=True, timeout=5)
+    if result.returncode or HOST_FP.encode() not in result.stdout.split():
+        raise SafeError("团队主机公钥指纹不匹配。")
+
+
 def ssh_command(settings):
     # Dedicated no-config invocation avoids unrelated LocalForward/ProxyCommand.
-    return [settings["ssh"], "-F", "none", "-N", "-T", "-p", str(SSH_PORT),
+    command = [settings["ssh"], "-F", "none", "-N", "-T", "-p", str(SSH_PORT),
             "-i", settings["ssh_key"], "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
             "-o", "ConnectTimeout=10", "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
-            "-o", "TCPKeepAlive=yes", "-o", "ForwardAgent=no",
-            "-L", f"127.0.0.1:{settings['port']}:{TARGET}", f"{settings['user']}@{HOST}"]
+            "-o", "TCPKeepAlive=yes", "-o", "ForwardAgent=no"]
+    if BUDGET_MODE:
+        path = settings.get("known_hosts")
+        keygen = shutil.which("ssh-keygen")
+        if not path or not keygen:
+            raise SafeError("本机团队主机公钥未初始化。")
+        verify_pin(read_regular(path), keygen)
+        command += ["-o", "UserKnownHostsFile=" + json.dumps(path, ensure_ascii=False),
+                    "-o", "GlobalKnownHostsFile=none", "-o", "HostKeyAlgorithms=ssh-ed25519",
+                    "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no"]
+    return command + ["-L", f"127.0.0.1:{settings['port']}:{TARGET}", f"{settings['user']}@{HOST}"]
 
 
 def tunnel_worker(state):
@@ -342,7 +429,8 @@ def tunnel_worker(state):
 
 
 def label(settings):
-    return f"com.sgrelay.ssh.{settings['user']}.{settings['port']}"
+    namespace = "budget" if BUDGET_MODE else "ssh"
+    return f"com.sgrelay.{namespace}.{settings['user']}.{settings['port']}"
 
 
 def stop_tunnel(state, settings):
@@ -420,21 +508,28 @@ def switch(state, mode):
     with lock(state / "操作.lock"):
         personal, team = snapshots(state, settings)
         config = Path(settings["config"])
-        before = read_regular(config)
-        if before not in (personal, team):
+        allowed_missing = BUDGET_MODE and settings.get("config_existed") is False
+        before = config_bytes(config, allow_missing=allowed_missing)
+        if not (route_equivalent(before, personal) or route_equivalent(before, team)):
             raise SafeError("App 配置已被另外修改；为保护你的设置，本次不覆盖。请本机 Agent 合并后重新建立快照。")
         if mode == "team":
             ensure_tunnel(state, settings)
         desired = team if mode == "team" else personal
-        if before != desired:
+        if not route_equivalent(before, desired):
             backup_dir = state / "备份"
             backup_dir.mkdir(mode=0o700, exist_ok=True)
             atomic_write(backup_dir / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".toml"), before)
             # Don't overwrite a change that occurred while waiting for SSH.
-            if read_regular(config) != before:
+            if config_bytes(config, allow_missing=allowed_missing) != before:
                 raise SafeError("准备连接期间配置发生变化，已停止切换。")
-            atomic_write(config, desired)
-        restored_label = "原 API 配置（不是个人 Plus）" if original_mode else "个人 Plus（首次验证的原配置）"
+            if allowed_missing and mode == "personal":
+                config.unlink()  # Restore absence of our own generated config after backing it up.
+            else:
+                if allowed_missing:
+                    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                atomic_write(config, desired)
+        restored_label = "安装前原配置" if BUDGET_MODE else (
+            "原 API 配置（不是个人 Plus）" if original_mode else "个人 Plus（首次验证的原配置）")
         print("配置已选择：" + ("团队中转（新加坡）" if mode == "team" else restored_label))
         print("请保存任务，完整退出并重新打开 Codex App，再新建任务。关闭窗口不等于退出。")
         print("此结果仅确认配置文件；App 实际请求通道须在重启后验证。本人登录文件未修改。")
@@ -450,7 +545,8 @@ def main(argv=None):
     parser.add_argument("--ssh-public-key")
     parser.add_argument("--key-file")
     parser.add_argument("--port", type=int, default=18318)
-    parser.add_argument("--model", default="gpt-6-astra")
+    parser.add_argument("--model", default=BUDGET_MODEL if BUDGET_MODE else "gpt-6-astra")
+    parser.add_argument("--known-hosts")
     parser.add_argument("--personal-verified", action="store_true")
     parser.add_argument("--baseline", choices=("personal", "original"), default="personal")
     parser.add_argument("--original-verified", action="store_true")
@@ -486,9 +582,10 @@ def main(argv=None):
         print("本套新加坡后台已停止；没有更改 App 模式或个人登录。")
     else:
         personal, team = snapshots(state, settings)
-        current = read_regular(settings["config"])
-        restored_label = "原 API 配置（不是个人 Plus）" if settings.get("baseline_kind") == "original" else "个人 Plus"
-        mode = "团队中转" if current == team else restored_label if current == personal else "未确认（配置另有修改）"
+        current = config_bytes(settings["config"], BUDGET_MODE and settings.get("config_existed") is False)
+        restored_label = "安装前原配置" if BUDGET_MODE else (
+            "原 API 配置（不是个人 Plus）" if settings.get("baseline_kind") == "original" else "个人 Plus")
+        mode = "团队中转" if route_equivalent(current, team) else restored_label if route_equivalent(current, personal) else "未确认（配置另有修改）"
         print("配置文件模式：" + mode)
         print("本套后台任务：" + ("运行中" if tunnel_running(state) else "未运行"))
         print("App 当前实际模式：未由此命令验证；重启后需在新任务核实。")

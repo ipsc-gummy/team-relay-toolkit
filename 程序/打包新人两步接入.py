@@ -89,11 +89,13 @@ def render_assignments(source, values):
     return result.encode()
 
 
-def render_core(user, fingerprint, deployment=None):
+def render_core(user, fingerprint, deployment=None, budget_mac=False):
     source = (ROOT / "程序/App切换/切换CodexApp.py").read_text()
     values = {"FINGERPRINTS": {user: fingerprint}}
     if deployment:
         values.update(HOST=deployment.host, HOST_FP=deployment.host_fingerprint, TARGET=deployment.target)
+    if budget_mac:
+        values.update(BUDGET_MODE=True)
     return render_assignments(source, values)
 
 
@@ -114,12 +116,15 @@ def check_public(data):
         raise ValueError("unexpected credential or unrelated content")
 
 
-def build_payload(user=None, fingerprint=None, token=None, platform="macos", deployment=None):
+def build_payload(user=None, fingerprint=None, token=None, platform="macos", deployment=None, budget_mac=False):
     """One payload implementation for new recipients and identity-preserving refreshes."""
     if platform not in ("macos", "windows"):
         raise ValueError("unsupported platform")
     if deployment and not user:
         raise ValueError("deployment parameters are only for personal packages")
+    if budget_mac and (not user or platform != "macos" or not deployment
+                       or deployment.gateway_port == 8317 or deployment.gateway_port < 1024):
+        raise ValueError("budget package requires a verified personal Mac deployment on a dedicated gateway port")
     prefix = "Codex团队接入/" if user else "团队中转_两步说明/"
     docs = ROOT / ("新人接入/Windows两步版" if platform == "windows" else "新人接入/两步版")
     payload = {prefix + name: (docs / name).read_bytes() for name in DOCS}
@@ -135,13 +140,18 @@ def build_payload(user=None, fingerprint=None, token=None, platform="macos", dep
         if platform == "windows":
             payload[prefix + entry] = payload[prefix + entry].replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
         code_path = "program/" if platform == "windows" else "程序/"
-        installer = (ROOT / "程序/新人一键接入/一键接入.py").read_bytes()
-        if deployment:
+        installer = (ROOT / "程序/新人一键接入" / ("Mac限额接入.py" if budget_mac else "一键接入.py")).read_bytes()
+        if budget_mac:
+            payload[prefix + DOCS[0]] = payload[prefix + DOCS[0]].replace("示例团队".encode(), "本团队".encode())
+            del payload[prefix + DOCS[1]]
+            payload[prefix + "FOR-CODEX.md"] = (docs / "限额版_FOR-CODEX.md").read_bytes()
+            payload[prefix + "known_hosts"] = f"{deployment.host} {deployment.host_key}\n".encode("ascii")
+        elif deployment:
             installer = render_assignments(installer.decode("utf-8"), {"PINNED_HOST_KEY": deployment.host_key})
             payload[prefix + DOCS[0]] = payload[prefix + DOCS[0]].replace("示例团队".encode(), "本团队".encode())
             payload[prefix + DOCS[1]] = render_deployment_doc(payload[prefix + DOCS[1]], deployment)
         payload[prefix + code_path + ("install.py" if platform == "windows" else "一键接入.py")] = installer
-        payload[prefix + code_path + "切换CodexApp.py"] = render_core(user, fingerprint, deployment)
+        payload[prefix + code_path + "切换CodexApp.py"] = render_core(user, fingerprint, deployment, budget_mac)
         payload[prefix + "个人参数.json"] = json.dumps({
             "user": user, "public_fingerprint": fingerprint,
             "host": deployment.host if deployment else EXAMPLE_HOST,
@@ -155,6 +165,9 @@ def build_payload(user=None, fingerprint=None, token=None, platform="macos", dep
             "existing_powershell_migration": "local_review_required_do_not_overwrite",
             "local_agent_entry": DOCS[1],
             **({"gateway_port": deployment.gateway_port} if deployment else {}),
+            **({"profile": "budget-mac", "model": "gpt-5.4-mini-2026-03-17", "local_agent_entry": "FOR-CODEX.md",
+                "managed_fields": "budget_team_only_original_snapshot_untouched", "package_release": "budget-mac-v1"}
+               if budget_mac else {}),
         }, ensure_ascii=False, indent=2).encode()
         for data in payload.values():
             check_public(data)
@@ -165,7 +178,7 @@ def build_payload(user=None, fingerprint=None, token=None, platform="macos", dep
     return payload
 
 
-def pack(destination, user=None, public_key=None, token_path=None, platform="macos", deployment=None):
+def pack(destination, user=None, public_key=None, token_path=None, platform="macos", deployment=None, budget_mac=False):
     fingerprint=token=None
     if user:
         if public_key.is_symlink() or token_path.is_symlink() or token_path.stat().st_mode & 0o077:
@@ -173,7 +186,7 @@ def pack(destination, user=None, public_key=None, token_path=None, platform="mac
         result=subprocess.run(["ssh-keygen","-lf",str(public_key)],capture_output=True,text=True,timeout=5,check=True)
         fingerprint=result.stdout.split()[1]
         token=token_path.read_text().strip()
-    payload=build_payload(user,fingerprint,token,platform,deployment)
+    payload=build_payload(user,fingerprint,token,platform,deployment,budget_mac)
     if destination.exists():
         raise ValueError("output already exists; choose a new path, do not overwrite")
     mode = 0o600 if user else 0o644
@@ -209,13 +222,16 @@ def main():
     route.add_argument('--host-public-key', type=Path, help='已通过可信渠道核验的 OpenSSH ssh-ed25519 主机 .pub 文件')
     route.add_argument('--gateway-port', type=int, help='服务器 127.0.0.1 上分配给该成员的网关端口（不改变客户端端口）')
     route.add_argument('--host-fingerprint', help='可选：独立核实的 SSH 主机 SHA256 指纹，用于再次比对')
+    route.add_argument('--budget-mac', action='store_true', help='使用固定模型和硬限额线路，禁止打成旧直通包')
     args = parser.parse_args()
     if bool(args.user) != bool(args.public_key) or bool(args.user) != bool(args.token_file):
         parser.error('personal package requires user, public key and existing token file together')
     if not args.user and any(value is not None for value in (args.server_ip, args.host_public_key, args.gateway_port, args.host_fingerprint)):
         parser.error('deployment parameters are only for personal packages')
     deployment = load_deployment(args.server_ip, args.host_public_key, args.gateway_port, args.host_fingerprint)
-    print(json.dumps(pack(args.output, args.user, args.public_key, args.token_file, args.platform, deployment), ensure_ascii=False, indent=2))
+    if args.budget_mac and not args.host_fingerprint:
+        parser.error('--budget-mac requires the separately verified --host-fingerprint')
+    print(json.dumps(pack(args.output, args.user, args.public_key, args.token_file, args.platform, deployment, args.budget_mac), ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

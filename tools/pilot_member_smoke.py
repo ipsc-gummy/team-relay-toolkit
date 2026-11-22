@@ -5,6 +5,7 @@ import argparse
 import ast
 from contextlib import contextmanager
 from importlib.util import module_from_spec, spec_from_file_location
+import json
 import os
 from pathlib import Path
 import pwd
@@ -82,7 +83,7 @@ def listens(port):
         return True
 
 
-def policy_and_package(root, port, token):
+def policy_and_package(root, port, token=None, budget_state=None):
     enrollment = import_script("开通新人")
     packaging = import_script("打包新人两步接入")
     for key in ("host", "member", "other"):
@@ -90,7 +91,19 @@ def policy_and_package(root, port, token):
                 "fixture-key-" + key)
     public = root / "member.pub"
     fingerprint = run("ssh-keygen", "-lf", str(public)).stdout.decode().split()[1]
-    policy, key_line = enrollment.restricted_tunnel_policy(MEMBER, public.read_text().strip(), fingerprint, port)
+    if budget_state is None:
+        policy, key_line = enrollment.restricted_tunnel_policy(MEMBER, public.read_text().strip(), fingerprint, port)
+    else:
+        from provision_budget_member import prepare
+        stage = prepare(user=MEMBER, public_key=public, fingerprint=fingerprint, gateway_port=port,
+                        state_dir=budget_state, ledger_name="budget.sqlite", members_name="members.json", stage_name="enroll")
+        policy = (stage / "sshd.conf").read_text()
+        # The staged member's standard relative path is for production. This
+        # namespace fixture uses the already existing disposable nobody identity.
+        policy = policy.replace("AuthorizedKeysFile .ssh/authorized_keys", f"AuthorizedKeysFile {root / 'auth-keys'}")
+        key_line = (stage / "authorized_keys").read_text()
+        token = (stage / "member.token").read_text().strip()
+        require(True, "budget-member-staged")
     auth = root / "auth-keys"
     auth.write_text(key_line)
     auth.chmod(0o644)  # Only an ephemeral public key; sshd reads as the nobody user.
@@ -121,9 +134,11 @@ LogLevel ERROR
     ) as file:
         file.write(token + "\n")
     deployment = packaging.load_deployment(HOST, root / "host.pub", port)
-    packaging.pack(output, MEMBER, public, token_path, "macos", deployment=deployment)
+    packaging.pack(output, MEMBER, public, token_path, "macos", deployment=deployment,
+                   budget_mac=budget_state is not None)
     with zipfile.ZipFile(output) as bundle:
-        require(len(bundle.namelist()) == 7 and output.stat().st_mode & 0o777 == 0o600, "member-package-permissions")
+        require(len(bundle.namelist()) == (8 if budget_state else 7) and output.stat().st_mode & 0o777 == 0o600,
+                "member-package-permissions")
         code = bundle.read("Codex团队接入/程序/切换CodexApp.py").decode()
         constants = {node.targets[0].id: ast.literal_eval(node.value) for node in ast.parse(code).body
                      if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
@@ -133,8 +148,14 @@ LogLevel ERROR
                 "package-pinned-gateway-and-identity")
         wire_token = bundle.read("Codex团队接入/中转访问密钥.txt").decode().strip()
         require(wire_token == token, "package-recipient-bearer")
+        host_line = constants["HOST"] + " " + deployment.host_key + "\n"
+        if budget_state is not None:
+            metadata = json.loads(bundle.read("Codex团队接入/个人参数.json"))
+            require(metadata.get("profile") == "budget-mac" and metadata.get("local_agent_entry") == "FOR-CODEX.md"
+                    and bundle.read("Codex团队接入/known_hosts").decode() == host_line, "budget-mac-pin-and-profile")
+            host_line = bundle.read("Codex团队接入/known_hosts").decode()
     known = root / "known-hosts"
-    known.write_text(constants["HOST"] + " " + deployment.host_key + "\n")
+    known.write_text(host_line)
     return config, constants, known, wire_token
 
 
