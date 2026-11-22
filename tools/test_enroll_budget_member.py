@@ -106,7 +106,7 @@ class EnrollmentTests(unittest.TestCase):
             enroll.atomic_map(self.active, b"{}\n", b"{}\n", self.service)
         self.assertEqual(self.active.read_bytes(), b'{"fixture":"ready"}\n')
 
-    def simulate_activation(self, fail_after_map):
+    def simulate_activation(self, failure=None):
         self.write_stage()
         check_plan = enroll.validate_plan
         commands = []
@@ -127,7 +127,7 @@ class EnrollmentTests(unittest.TestCase):
             if cmd == "getent":
                 return SimpleNamespace(returncode=2)
             if cmd == "id":
-                return SimpleNamespace(stdout="alice\n")
+                return SimpleNamespace(stdout="alice unapproved\n" if failure == "groups" else "alice\n")
             if cmd == "systemctl":
                 if action == "start":
                     statuses[enroll.UNIT] = "active"
@@ -146,16 +146,17 @@ class EnrollmentTests(unittest.TestCase):
 
         with patch.multiple(enroll, validate_plan=validate, key_accepted=lambda *_: None, ssh_effective=effective,
                             check_effective=lambda _: None, run=run, state_of=lambda unit: statuses[unit],
-                            health=lambda token: not (fail_after_map and token)):
-            if fail_after_map:
-                with self.assertRaisesRegex(enroll.Stopped, "health check failed"):
+                            gateway_listener=lambda *, running: (statuses[enroll.UNIT] == "active") is running,
+                            health=lambda token: not (failure == "health" and token)):
+            if failure:
+                with self.assertRaises(enroll.Stopped):
                     enroll.activate(self.stage, self.service, "root")
             else:
                 enroll.activate(self.stage, self.service, "root")
         return commands, actual["value"]
 
     def test_first_activation_only_mutates_member_and_dedicated_unit(self):
-        commands, (_, _, candidate, _, _, key) = self.simulate_activation(False)
+        commands, (_, _, candidate, _, _, key) = self.simulate_activation()
         self.assertEqual(self.active.read_bytes(), candidate)
         self.assertEqual(self.ledger.balance("alice").limit, CAP)
         self.assertEqual((self.homes / "alice/.ssh/authorized_keys").read_bytes(), key)
@@ -166,7 +167,7 @@ class EnrollmentTests(unittest.TestCase):
         self.assertFalse(any("cliproxyapi" in arg for cmd in commands for arg in cmd))
 
     def test_failed_activation_restores_only_map_and_keeps_stable_ledger(self):
-        commands, _ = self.simulate_activation(True)
+        commands, _ = self.simulate_activation("health")
         self.assertEqual(self.active.read_bytes(), b"{}\n")
         self.assertEqual(self.ledger.balance("alice").limit, CAP)
         self.assertEqual(list(self.homes.iterdir()), [])
@@ -174,6 +175,30 @@ class EnrollmentTests(unittest.TestCase):
         self.assertFalse((self.stage / "ACTIVATED").exists())
         self.assertIn(("/usr/bin/systemctl", "stop", enroll.UNIT), commands)
         self.assertNotIn(("/usr/bin/systemctl", "reload", enroll.SSH_UNIT), commands)
+
+    def test_late_failure_removes_only_member_ssh_changes(self):
+        unrelated = self.ssh / "10-test.conf"
+        unrelated.write_bytes(b"# Existing rule.\n")
+        commands, _ = self.simulate_activation("groups")
+        self.assertEqual([path.name for path in self.ssh.iterdir()], [unrelated.name])
+        self.assertEqual(unrelated.read_bytes(), b"# Existing rule.\n")
+        self.assertEqual(list(self.homes.iterdir()), [])
+        self.assertEqual(self.active.read_bytes(), b"{}\n")
+        self.assertEqual(self.ledger.balance("alice").limit, CAP)
+        self.assertIn(("/usr/sbin/userdel", "alice"), commands)
+        self.assertEqual(commands.count(("/usr/bin/systemctl", "reload", enroll.SSH_UNIT)), 2)
+
+    def test_listener_must_be_owned_by_exact_unit_pid_and_loopback(self):
+        fake = {"socket": f'LISTEN 0 5 127.0.0.1:{enroll.PORT} 0.0.0.0:* users:(("python3",pid=444,fd=4))\n'}
+        def run(*args):
+            return SimpleNamespace(stdout=fake["socket"] if args[0] == "/usr/bin/ss" else "444\n")
+        with patch.object(enroll, "run", side_effect=run):
+            self.assertTrue(enroll.gateway_listener(running=True))
+            self.assertFalse(enroll.gateway_listener(running=False))
+            fake["socket"] = fake["socket"].replace("127.0.0.1", "0.0.0.0")
+            self.assertFalse(enroll.gateway_listener(running=True))
+            fake["socket"] = ""
+            self.assertTrue(enroll.gateway_listener(running=False))
 
 
 if __name__ == "__main__":
