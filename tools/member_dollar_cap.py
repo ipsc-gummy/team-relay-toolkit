@@ -28,7 +28,7 @@ CAP = 100_000_000_000  # nano-USD; $100, not shared across member IDs
 INPUT_RATE, OUTPUT_RATE = 750, 4500  # nano-USD per token, full uncached Standard price
 MAX_INPUT, DEFAULT_OUTPUT, MAX_OUTPUT = 400_000, 256, 4096
 MAX_REQUEST, MAX_RESPONSE, MAX_EVENT = 128 * 1024, 2 * 1024 * 1024, 256 * 1024
-REVIEW_UNTIL = datetime(2026, 11, 29, tzinfo=timezone.utc)
+REVIEW_UNTIL = datetime(2026, 12, 22, tzinfo=timezone.utc)
 MEMBER_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
 TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 

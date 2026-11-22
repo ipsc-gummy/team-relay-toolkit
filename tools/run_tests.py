@@ -18,6 +18,9 @@ TESTS = (
     "tools/test_pilot_member_gateway.py",
     "tools/test_member_dollar_cap.py",
     "tools/test_provision_budget_member.py",
+    "tools/test_accept_budget_upstream.py",
+    "tools/test_install_budget_relay.py",
+    "tools/test_enroll_budget_member.py",
     "程序/测试打包部署参数.py",
 )
 
